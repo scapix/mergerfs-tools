@@ -95,7 +95,7 @@ def build_copy_file(src,tgt,rel):
     return ['rsync',
             '-avHAXWE',
             '--numeric-ids',
-            '--progress',
+            #'--progress',
             '--relative',
             srcpath,
             tgtpath]
