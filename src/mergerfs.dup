@@ -332,6 +332,10 @@ def main():
 
     try:
         for (dirpath,dirnames,filenames) in os.walk(args.dir):
+            if match(dirpath,excludes):
+                continue
+            if not match(dirpath,includes):
+                continue
             for filename in filenames:
                 if match(filename,excludes):
                     continue
