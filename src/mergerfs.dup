@@ -241,13 +241,13 @@ def newest_dupfun(default_basepath,relpath,basepaths):
 
     mtime = sts[basepaths[0]].st_mtime
     if not all([st.st_mtime == mtime for st in sts.values()]):
-        return sorted(sts,key=lambda x: sts.get(x).st_mtime,reverse=True)[0]
+        return (sorted(sts,key=lambda x: sts.get(x).st_mtime,reverse=True)[0], sts)
 
     ctime = sts[basepaths[0]].st_ctime
     if not all([st.st_ctime == ctime for st in sts.values()]):
-        return sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=True)[0]
+        return (sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=True)[0], sts)
 
-    return default_basepath
+    return (default_basepath, sts)
 
 
 def oldest_dupfun(default_basepath,relpath,basepaths):
@@ -347,10 +347,16 @@ def main():
                 relpath  = mergerfs_relpath(fullpath)
                 existing = mergerfs_all_basepaths(fullpath,relpath)
 
-                srcpath  = dupfun(basepath,relpath,existing)
+                (srcpath, sts) = dupfun(basepath,relpath,existing)
                 srcfile  = os.path.join(srcpath,relpath)
                 srcfile_size = os.lstat(srcfile).st_size
+
                 existing.remove(srcpath)
+
+                st_uid = sts[srcpath].st_uid
+                st_gid = sts[srcpath].st_gid
+                st_mode = sts[srcpath].st_mode
+                st_mtime = sts[srcpath].st_mtime
 
                 i = 1
                 copies = []
@@ -358,11 +364,14 @@ def main():
                     if prune and i >= count:
                         break
                     copies.append(tgtpath)
-                    args = build_copy_file(srcpath,tgtpath,relpath)
-                    print('# overwrite')
-                    print_args(args)
-                    if execute:
-                        execute_cmd(args)
+                    if sts[tgtpath].st_mtime != st_mtime or sts[tgtpath].st_uid != st_uid or sts[tgtpath].st_gid != st_gid or sts[tgtpath].st_mode != st_mode:
+                        args = build_copy_file(srcpath,tgtpath,relpath)
+                        print('# overwrite')
+                        print_args(args)
+                        if execute:
+                            execute_cmd(args)
+                    #else:
+                    #    print(srcfile[:80], tgtpath, end='\r')
                     i += 1
 
                 for _ in range(i,count):
