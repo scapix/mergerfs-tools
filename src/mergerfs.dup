@@ -243,9 +243,9 @@ def newest_dupfun(default_basepath,relpath,basepaths):
     if not all([st.st_mtime == mtime for st in sts.values()]):
         return (sorted(sts,key=lambda x: sts.get(x).st_mtime,reverse=True)[0], sts)
 
-    ctime = sts[basepaths[0]].st_ctime
-    if not all([st.st_ctime == ctime for st in sts.values()]):
-        return (sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=True)[0], sts)
+    #ctime = sts[basepaths[0]].st_ctime
+    #if not all([st.st_ctime == ctime for st in sts.values()]):
+    #    return (sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=True)[0], sts)
 
     return (default_basepath, sts)
 
@@ -255,13 +255,13 @@ def oldest_dupfun(default_basepath,relpath,basepaths):
 
     mtime = sts[basepaths[0]].st_mtime
     if not all([st.st_mtime == mtime for st in sts.values()]):
-        return sorted(sts,key=lambda x: sts.get(x).st_mtime,reverse=False)[0]
+        return (sorted(sts,key=lambda x: sts.get(x).st_mtime,reverse=False)[0], sts)
 
-    ctime = sts[basepaths[0]].st_ctime
-    if not all([st.st_ctime == ctime for st in sts.values()]):
-        return sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=False)[0]
+#    ctime = sts[basepaths[0]].st_ctime
+#    if not all([st.st_ctime == ctime for st in sts.values()]):
+#        return (sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=False)[0], sts)
 
-    return default_basepath
+    return (default_basepath, sts)
 
 
 def largest_dupfun(default_basepath,relpath,basepaths):
@@ -269,9 +269,9 @@ def largest_dupfun(default_basepath,relpath,basepaths):
 
     size = sts[basepaths[0]].st_size
     if not all([st.st_size == size for st in sts.values()]):
-        return sorted(sts,key=lambda x: sts.get(x).st_size,reverse=True)[0]
+        return (sorted(sts,key=lambda x: sts.get(x).st_size,reverse=True)[0], sts)
 
-    return default_basepath
+    return (default_basepath, sts)
 
 
 def smallest_dupfun(default_basepath,relpath,basepaths):
@@ -279,13 +279,14 @@ def smallest_dupfun(default_basepath,relpath,basepaths):
 
     size = sts[basepaths[0]].st_size
     if not all([st.st_size == size for st in sts.values()]):
-        return sorted(sts,key=lambda x: sts.get(x).st_size,reverse=False)[0]
+        return (sorted(sts,key=lambda x: sts.get(x).st_size,reverse=False)[0], sts)
 
-    return default_basepath
+    return (default_basepath, sts)
 
 
 def mergerfs_dupfun(default_basepath,relpath,basepaths):
-    return default_basepath
+    sts = dict([(f,os.lstat(os.path.join(f,relpath))) for f in basepaths])
+    return (default_basepath, sts)
 
 
 def getdupfun(name):
@@ -352,21 +353,34 @@ def main():
                 srcfile_size = os.lstat(srcfile).st_size
 
                 existing.remove(srcpath)
-
-                st_uid = sts[srcpath].st_uid
-                st_gid = sts[srcpath].st_gid
-                st_mode = sts[srcpath].st_mode
-                st_mtime = sts[srcpath].st_mtime
-
                 i = 1
                 copies = []
                 for tgtpath in existing:
                     if prune and i >= count:
                         break
+
                     copies.append(tgtpath)
-                    if sts[tgtpath].st_mtime != st_mtime or sts[tgtpath].st_uid != st_uid or sts[tgtpath].st_gid != st_gid or sts[tgtpath].st_mode != st_mode:
+                    if (sts[tgtpath].st_mtime != sts[srcpath].st_mtime
+                      #or sts[tgtpath].st_ctime != sts[srcpath].st_ctime
+                      or sts[tgtpath].st_uid != sts[srcpath].st_uid
+                      or sts[tgtpath].st_gid != sts[srcpath].st_gid
+                      or sts[tgtpath].st_mode != sts[srcpath].st_mode
+                      or sts[tgtpath].st_size != sts[srcpath].st_size):
                         args = build_copy_file(srcpath,tgtpath,relpath)
                         print('# overwrite')
+                        #print("---------")
+                        #print("fullpath: ",fullpath)
+                        #print("basepath: ",basepath)
+                        #print("relpath: ",relpath)
+                        #print("srcpath: ",srcpath)
+                        #print("srcfile: ",srcfile)
+                        #print("srcfile_size: ",srcfile_size)
+                        #print('mtime: {} {}'.format(sts[srcpath].st_mtime,sts[tgtpath].st_mtime))
+                        #print('ctime: {} {}'.format(sts[srcpath].st_ctime,sts[tgtpath].st_ctime))
+                        #print('uid:   {} {}'.format(sts[srcpath].st_uid,sts[tgtpath].st_uid))
+                        #print('gid:   {} {}'.format(sts[srcpath].st_gid,sts[tgtpath].st_gid))
+                        #print('mode:  {} {}'.format(sts[srcpath].st_mode,sts[tgtpath].st_mode))
+                        #print('size:  {} {}'.format(sts[srcpath].st_size,sts[tgtpath].st_size))
                         print_args(args)
                         if execute:
                             execute_cmd(args)
