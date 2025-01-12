@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+
+# Copyright (c) 2016, Antonio SJ Musumeci <trapexit@spawn.link>
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+import argparse
+import ctypes
+import errno
+import fnmatch
+import io
+import os
+import shlex
+import subprocess
+import sys
+import time
+import signal
+import fcntl
+import json
+import pickle
+import csv
+import gzip
+import hashlib
+from datetime import datetime
+# from rich.pretty import pprint
+# from rich import print as cprint
+from rich.console import Console
+console = Console()
+
+_libc = ctypes.CDLL("libc.so.6",use_errno=True)
+_lgetxattr = _libc.lgetxattr
+_lgetxattr.argtypes = [ctypes.c_char_p,ctypes.c_char_p,ctypes.c_void_p,ctypes.c_size_t]
+def lgetxattr(path,name):
+    if type(path) == str:
+        path = path.encode(errors='backslashreplace')
+    if type(name) == str:
+        name = name.encode(errors='backslashreplace')
+    length = 64
+    while True:
+        buf = ctypes.create_string_buffer(length)
+        res = _lgetxattr(path,name,buf,ctypes.c_size_t(length))
+        if res >= 0:
+            return buf.raw[0:res].decode(errors='backslashreplace')
+        else:
+            err = ctypes.get_errno()
+            if err == errno.ERANGE:
+                length *= 2
+            elif err == errno.ENODATA:
+                return None
+            else:
+                raise IOError(err,os.strerror(err),path)
+
+
+def ismergerfs(path):
+    try:
+        lgetxattr(path,'user.mergerfs.basepath')
+        return True
+    except IOError as e:
+        return False
+
+
+def mergerfs_control_file(basedir):
+    if basedir == '/':
+        return None
+    ctrlfile = os.path.join(basedir,'.mergerfs')
+    if os.path.exists(ctrlfile):
+        return ctrlfile
+    basedir = os.path.dirname(basedir)
+    return mergerfs_control_file(basedir)
+
+
+def mergerfs_branches(ctrlfile):
+    branches = lgetxattr(ctrlfile,'user.mergerfs.srcmounts')
+    branches = branches.split(':')
+    return branches
+
+
+def match(filename,matches):
+    for match in matches:
+        if fnmatch.fnmatch(filename,match):
+            return True
+    return False
+
+
+def execute_cmd(args):
+    # print(args)
+    return subprocess.call(args)
+
+
+def print_args(args):
+    quoted = [shlex.quote(arg) for arg in args]
+    print(' '.join(quoted))
+
+
+def build_copy_file(src,tgt,rel):
+    srcpath = os.path.join(src,'./',rel)
+    tgtpath = tgt + '/'
+    return ['rsync',
+            '-avHAXWE',
+            '--numeric-ids',
+            #'--progress',
+            '--relative',
+            srcpath,
+            tgtpath]
+
+
+def build_branches_freespace(branches, caches):
+    rv = dict()
+    rc = dict()
+    for branch in branches:
+        st = os.statvfs(branch)
+        if match(branch, caches):
+            rc[branch] = st.f_bavail * st.f_frsize
+        else:
+            rv[branch] = st.f_bavail * st.f_frsize
+    return (rv, rc)
+
+
+def print_help():
+    help = \
+'''
+usage: mergerfs.dup [<options>] <dir>
+
+Duplicate files & directories across multiple drives in a pool.
+Will print out commands for inspection and out of band use.
+
+positional arguments:
+  dir                    starting directory
+
+optional arguments:
+  -c, --count=           Number of copies to create. (default: 2)
+  -d, --dup=             Which file (if more than one exists) to choose to
+                         duplicate. Each one falls back to `mergerfs` if
+                         all files have the same value. (default: newest)
+                         * newest   : file with largest mtime
+                         * oldest   : file with smallest mtime
+                         * smallest : file with smallest size
+                         * largest  : file with largest size
+                         * mergerfs : file chosen by mergerfs' getattr
+  -p, --prune            Remove files above `count`. Without this enabled
+                         it will update all existing files.
+  -e, --execute          Execute `rsync` and `rm` commands. Not just
+                         print them.
+  -I, --include=         fnmatch compatible filter to include files, directories.
+                         Can be used multiple times.
+  -E, --exclude=         fnmatch compatible filter to exclude files, directories..
+                         Can be used multiple times.
+  -C, --cache=           Cache disk. Does not count towards 'count' copies.
+
+  -X, --exclude-cache    fnmatch compatible fitler to exclude from caching.
+'''
+    print(help)
+
+
+def buildargparser():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('dir',
+                        type=str,
+                        nargs='?',
+                        default=None)
+    parser.add_argument('-c','--count',
+                        dest='count',
+                        type=int,
+                        default=2)
+    parser.add_argument('-p','--prune',
+                        dest='prune',
+                        action='store_true')
+    parser.add_argument('-d','--dup',
+                        choices=['newest','oldest',
+                                 'smallest','largest',
+                                 'mergerfs'],
+                        default='mergerfs')
+    parser.add_argument('-e','--execute',
+                        dest='execute',
+                        action='store_true')
+    parser.add_argument('-I','--include',
+                        dest='include',
+                        type=str,
+                        action='append',
+                        default=[])
+    parser.add_argument('-E','--exclude',
+                        dest='exclude',
+                        type=str,
+                        action='append',
+                        default=[])
+    parser.add_argument('-X','--exclude-cache',
+                        dest='excludecache',
+                        type=str,
+                        action='append',
+                        default=[])
+    parser.add_argument('-C','--cache',
+                        dest='cache',
+                        type=str,
+                        action='append',
+                        default=[])
+    parser.add_argument('-D','--diff',
+                        dest='diff',
+                        type=str,
+                        # action='append',
+                        default="mtime,size,uid,gid,mode")
+                        # default="uid,gid,mode")
+
+    parser.add_argument('-h','--help',
+                        action='store_true')
+
+    return parser
+
+
+def xattr_basepath(fullpath):
+    return lgetxattr(fullpath,'user.mergerfs.basepath')
+
+
+def xattr_allpaths(fullpath):
+    return lgetxattr(fullpath,'user.mergerfs.allpaths')
+
+
+def xattr_relpath(fullpath):
+    return lgetxattr(fullpath,'user.mergerfs.relpath')
+
+
+def exists(base,rel,name):
+    fullpath = os.path.join(base,rel,name)
+    return os.path.lexists(fullpath)
+
+
+def mergerfs_all_basepaths(fullpath,relpath):
+    attr = xattr_allpaths(fullpath)
+    if not attr:
+        dirname  = os.path.dirname(fullpath)
+        basename = os.path.basename(fullpath)
+        attr     = xattr_allpaths(dirname)
+        attr     = attr.split('\0')
+        attr     = [os.path.join(path,basename)
+                    for path in attr
+                    if os.path.lexists(os.path.join(path,basename))]
+    else:
+        attr = attr.split('\0')
+    return [x[:-len(relpath)].rstrip('/') for x in attr]
+
+
+def mergerfs_basepath(fullpath):
+    attr = xattr_basepath(fullpath)
+    if not attr:
+        dirname  = os.path.dirname(fullpath)
+        basename = os.path.basename(fullpath)
+        attr     = xattr_allpaths(dirname)
+        attr     = attr.split('\0')
+        for path in attr:
+            fullpath = os.path.join(path,basename)
+            if os.path.lexists(fullpath):
+                relpath = xattr_relpath(dirname)
+                return path[:-len(relpath)].rstrip('/')
+    return attr
+
+
+def mergerfs_relpath(fullpath):
+    attr = xattr_relpath(fullpath)
+    if not attr:
+        dirname  = os.path.dirname(fullpath)
+        basename = os.path.basename(fullpath)
+        attr     = xattr_relpath(dirname)
+        attr     = os.path.join(attr,basename)
+    return attr.lstrip('/')
+
+
+def newest_dupfun(default_basepath,relpath,basepaths):
+    sts = dict([(f,os.lstat(os.path.join(f,relpath))) for f in basepaths])
+
+    mtime = sts[basepaths[0]].st_mtime
+    if not all([st.st_mtime == mtime for st in sts.values()]):
+        return sorted(sts,key=lambda x: sts.get(x).st_mtime,reverse=True)[0]
+
+    #ctime = sts[basepaths[0]].st_ctime
+    #if not all([st.st_ctime == ctime for st in sts.values()]):
+    #    return (sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=True)[0], sts)
+
+    return default_basepath
+
+
+def oldest_dupfun(default_basepath,relpath,basepaths):
+    sts = dict([(f,os.lstat(os.path.join(f,relpath))) for f in basepaths])
+
+    mtime = sts[basepaths[0]].st_mtime
+    if not all([st.st_mtime == mtime for st in sts.values()]):
+        return sorted(sts,key=lambda x: sts.get(x).st_mtime,reverse=False)[0]
+
+#    ctime = sts[basepaths[0]].st_ctime
+#    if not all([st.st_ctime == ctime for st in sts.values()]):
+#        return (sorted(sts,key=lambda x: sts.get(x).st_ctime,reverse=False)[0], sts)
+
+    return default_basepath
+
+
+def largest_dupfun(default_basepath,relpath,basepaths):
+    sts = dict([(f,os.lstat(os.path.join(f,relpath))) for f in basepaths])
+
+    size = sts[basepaths[0]].st_size
+    if not all([st.st_size == size for st in sts.values()]):
+        return sorted(sts,key=lambda x: sts.get(x).st_size,reverse=True)[0]
+
+    return default_basepath
+
+
+def smallest_dupfun(default_basepath,relpath,basepaths):
+    sts = dict([(f,os.lstat(os.path.join(f,relpath))) for f in basepaths])
+
+    size = sts[basepaths[0]].st_size
+    if not all([st.st_size == size for st in sts.values()]):
+        return sorted(sts,key=lambda x: sts.get(x).st_size,reverse=False)[0]
+
+    return default_basepath
+
+
+def mergerfs_dupfun(default_basepath,relpath,basepaths):
+    return default_basepath
+
+
+def getdupfun(name):
+    funs = {'newest': newest_dupfun,
+            'oldest': oldest_dupfun,
+            'smallest': smallest_dupfun,
+            'largest': largest_dupfun,
+            'mergerfs': mergerfs_dupfun}
+    return funs[name]
+
+
+def get_file_stat(fullpath):
+    filestat = os.lstat(fullpath)
+    return dict(zip('mode ino dev nlink uid gid size atime mtime ctime'.split(), filestat))
+
+
+def get_file_digest(fullpath):
+    _hash = hashlib.blake2b()
+    blocksize = 65536
+    stat = os.lstat(fullpath)
+    with open(fullpath,'rb') as f:
+        # digest = hashlib.file_digest(f, "sha256")
+        buf = f.read(blocksize)
+        while buf:
+            _hash.update(buf)
+            buf = f.read(blocksize)
+    # revert atime, mtime do povodneho stavu pred ratanim digestu
+    os.utime(fullpath, times=(stat.st_atime, stat.st_mtime))
+    return '{}:{}'.format(_hash.name,_hash.hexdigest())
+
+
+def get_different_stats(srcsts,tgtsts,fields):
+    dif = dict(srcsts.items() - tgtsts.items())
+    return [k for k in dif if k in fields]
+
+
+def equal_stats(srcsts,tgtsts,fields):
+    return True if len(get_different_stats(srcsts,tgtsts,fields)) == 0 else False
+
+
+def get_file_stat_differences(srcpath,tgtpath,relpath,diffields):
+    if (srcpath == tgtpath):
+        return []
+    srcsts = get_file_stat(os.path.join(srcpath,relpath))
+    tgtsts = get_file_stat(os.path.join(tgtpath,relpath))
+    return get_different_stats(srcsts,tgtsts,diffields)
+
+
+def equal_files_stats(srcpath,tgtpath,relpath,diffields):
+    return True if len(get_file_stat_differences(srcpath,tgtpath,relpath,diffields)) == 0 else False
+
+
+def stats_content_updated(difs):
+    if 'mtime' in difs or 'size' in difs:
+        return True
+    return False
+
+
+def build_existing(existing,branches,caches):
+    cache_list = []
+    branch_list = []
+    for path in existing:
+        if path in branches:
+            branch_list.append(path)
+        elif path in caches:
+            cache_list.append(path)
+    # most free space to lowest free space - if pruning happens, prone from LFS disk
+    cache_list = sorted(cache_list, key=caches.get, reverse=True)
+    branch_list = sorted(branch_list, key=branches.get, reverse=True)
+    return (cache_list, branch_list)
+
+
+def files_update(srcpath,relpath,existing,count,prune,diffields,commands,logtext=""):
+    i = 0
+    copies = []
+    for tgtpath in existing:
+        if prune and i >= count:
+            break
+        copies.append(tgtpath)
+        i += 1
+        difs = get_file_stat_differences(srcpath,tgtpath,relpath,diffields)
+        if len(difs) > 0:
+            args = build_copy_file(srcpath,tgtpath,relpath)
+            commands[tgtpath] = {"command":"update - overwrite {}# {}".format(logtext,', '.join(difs)),"args":args,'priority':2}
+    return copies
+
+
+def files_backup(srcpath,relpath,srcfile_size,branches,copies,count,commands,logtext=""):
+    i = len(copies)
+    for _ in range(i,count):
+        for branch in sorted(branches,key=branches.get,reverse=True):
+            tgtfile = os.path.join(branch,relpath)
+            if branch in copies or os.path.exists(tgtfile):
+                continue
+            copies.append(branch)
+            branches[branch] -= srcfile_size
+            args = build_copy_file(srcpath,branch,relpath)
+            commands[branch] = {"command":"backup - copy {}".format(logtext),"args":args,'priority':1}
+            break
+
+
+def files_prune(relpath,srcfile_size,branches,existing,copies,prune,commands,logtext=""):
+    if prune:
+        leftovers = set(existing) - set(copies)
+        for branch in leftovers:
+            branches[branch] += srcfile_size
+            tgtfile = os.path.join(branch,relpath)
+            args = ['rm','-vf',tgtfile]
+            commands[branch] = {"command":"prune - remove {}".format(logtext),"args":args,'priority':3}
+
+
+def print_diskdebug(srcpath, caches, existing_caches, copies_cache, branches, existing_branches, copies):
+    txt_list = []
+    for b in caches:
+        txt_source = "=" if b == srcpath else ""
+        if b in copies_cache:
+            if b in existing_caches:
+                txt_list.append("C{}".format(txt_source))
+            else:
+                txt_list.append("c{}".format(txt_source))
+        else:
+            if b in existing_caches:
+                txt_list.append("-{}".format(txt_source))
+            else:
+                txt_list.append(".{}".format(txt_source))
+    for b in branches:
+        txt_source = "=" if b == srcpath else ""
+        if b in copies:
+            if b in existing_branches:
+                txt_list.append("O{}".format(txt_source))
+            else:
+                txt_list.append("o{}".format(txt_source))
+        else:
+            if b in existing_branches:
+                txt_list.append("-{}".format(txt_source))
+            else:
+                txt_list.append(".{}".format(txt_source))
+    print_args(txt_list)
+
+
+def dbentry_all_digests_same(entry):
+    branches = entry["branches"]
+    expected_value = next(iter(branches.values()))["digest"] # check for an empty dictionary first if that's possible
+    all_equal = all(value["digest"] == expected_value for value in branches.values())
+    return all_equal
+
+
+def dbentry_get_stat_differences(entry,fields):
+    # srcsts = get_file_stat(os.path.join(srcpath,relpath))
+    # tgtsts = get_file_stat(os.path.join(tgtpath,relpath))
+    # return get_different_stats(srcsts,tgtsts,diffields)
+    branches = entry["branches"]
+    difs = []
+    for field in fields:
+        expected_value = next(iter(branches.values()))["stat"][field] # check for an empty dictionary first if that's possible
+        all_equal = all(value["stat"][field] == expected_value for value in branches.values())
+        if not all_equal:
+            difs.append(field)
+    return difs
+
+
+def dbentry_all_stats_consistent(entry,fields):
+    return True if len(dbentry_get_stat_differences(entry,fields)) == 0 else False
+
+
+def create_dbentry(fullpath,digests=None,branches=None):
+    relpath = mergerfs_relpath(fullpath)
+    existing = mergerfs_all_basepaths(fullpath,relpath)
+    if branches:
+        existing = list(set(existing) & set(branches))
+    branches_digest = {}
+    dbentry = {'state':255,"consistency":'---',"integrity":'--',"checked":time.time(),"branches":branches_digest}
+    for branch in existing:
+        filepath = os.path.join(branch,relpath)
+        branches_digest[branch] = {"stat":get_file_stat(filepath),'state':255,'digest':'None' }
+        if digests and (branch in digests):
+            # print("create_dbentry - using cached digest for branch {}".format(branch))
+            branches_digest[branch]["digest"] = digests[branch]
+        else:
+            branches_digest[branch]["digest"] = get_file_digest(filepath)
+
+    return dbentry
+
+
+def xor_two_str(a,b):
+    return ''.join([hex(ord(a[i%len(a)]) ^ ord(b[i%(len(b))]))[2:] for i in range(max(len(a), len(b)))])
+
+
+def dbentry_check_consistency_obsolete(dbentry,diffields):
+    state = dbentry["consistency"]
+    if not dbentry_all_stats_consistent(dbentry,diffields):
+        state = state[:0] + 'X' + state[1:]
+        # print(f"    create_dbentry diff stats : {dbentry_get_stat_differences(dbentry,diffields)}")
+        statdif = dbentry_get_stat_differences(dbentry,diffields)
+        if stats_content_updated(statdif):
+            state = state[:1] + 'X' + state[2:]
+        else:
+            state = state[:1] + 'O' + state[2:]
+    else:
+        state = state[:0] + 'OO' + state[2:]
+
+    if not dbentry_all_digests_same(dbentry):
+        state = state[:2] + 'X' + state[3:]
+        # print(f"    create_dbentry diff digests")
+    else:
+        state = state[:2] + 'O' + state[3:]
+    dbentry["consistency"] = state
+
+    for branchdata in dbentry["branches"].values():
+        branchdata["consistency"] = state
+
+    return (state == 'OOO')
+
+
+def dbentry_check_integrity_obsolete(newentry,oldentry,diffields):
+    newentry['integrity'] = []
+
+    oldbranches = oldentry["branches"]
+    newbranches = newentry["branches"]
+
+    for newbranch,newbranchvalues in newbranches.items():
+
+        if newbranch in oldbranches:
+            branchintegrity = '--'
+            oldbranchvalues = oldbranches[newbranch]
+            statdif = get_different_stats(newbranchvalues['stat'],oldbranchvalues['stat'],diffields)
+            if stats_content_updated(statdif):
+                # content zmeneny (mtime alebo size). digest nesied nemusi
+                branchintegrity = 'XX'
+            elif len(statdif) > 0:
+                # inak sa zmenili iba file stats (mode, ...)
+                branchintegrity = 'XO'
+            else:
+                # alebo je to presne to iste
+                branchintegrity = 'OO'
+            # console.log(f"{newbranch} - digest diff {xor_two_str(newbranchvalues['digest'],oldbranchvalues['digest'])}")
+            if newbranchvalues['digest'] != oldbranchvalues['digest']:
+                # ak nebol content zmeny a nesedi digest tak mame ERROR na disku
+                branchintegrity += 'X'
+            else:
+                branchintegrity += 'O'
+
+        else:
+            branchintegrity = 'OOO'
+
+        newbranchvalues['integrity'] = branchintegrity
+        newentry['integrity'].append(branchintegrity)
+
+        if branchintegrity == 'OOO':
+            console.log(f"{newbranch} - files are same")
+        elif branchintegrity == 'XOO':
+            console.log(f"{newbranch} - stat changed {statdif}")
+        elif branchintegrity == 'XXO'or branchintegrity == 'XXX':
+            console.log(f"{newbranch} - content changed {statdif}")
+        elif branchintegrity == 'OOX' or branchintegrity == 'XOX':
+            console.log(f"{newbranch} - [red]DIGEST MISMATCH ON UNCHANGED FILE!")
+        else:
+            console.log(f"{newbranch} - [yellow]UNDETERMINED STATE!")
+
+
+def dbentry_log(entry,diffields):
+    txt = ["stat","content(stat)","content(digest)"]
+    result = {'consistency':[],'integrity':[]}
+    code = entry['state']
+    codes = []
+    for i in range(0,3):
+        if (code >> i) & 1 == 1: pass #codes.append(txt[i]+" OK")
+        else: codes.append("[red]"+txt[i]+"[/red]") #codes.append(txt[i]+" [red]X[/red]")
+    result['consistency'] = codes
+    codes = []
+    for i in range(4,7):
+        if (code >> i) & 1 == 1: pass #codes.append(txt[i-4]+" OK")
+        else: codes.append("[red]"+txt[i-4]+"[/red]") #codes.append(txt[i-4]+" [red]X[/red]")
+    result['integrity'] = codes
+    return result
+
+
+def create_status_code(a,b,diffields,startbit):
+    state = 0
+    statdif = get_different_stats(a['stat'],b['stat'],diffields)
+    if len(statdif) > 0:
+        state |= 2**0
+    if stats_content_updated(statdif):
+        state |= 2**1
+    if a['digest'] != b['digest']:
+        state |= 2**2
+        statdif.append('digest')
+    return (255^(state << startbit),statdif)
+
+
+def dbentry_check_consistency(entry,srcpath,diffields):
+    srcbranchvalues = entry["branches"][srcpath]
+    for branchpath,branchvalues in entry["branches"].items():
+        (branchstate,diff) = create_status_code(branchvalues,srcbranchvalues,diffields,0)
+        branchvalues['state'] &= branchstate
+        entry['state'] &= branchstate
+        branchvalues['consistencydiff'] = diff
+        console.log(f"{branchpath} : {branchstate} - consistency diff {diff}")
+
+
+def dbentry_check_integrity(newentry,oldentry,diffields):
+    oldbranches = oldentry["branches"]
+    for newbranchpath,newbranchvalues in newentry["branches"].items():
+        if newbranchpath in oldbranches:
+            (branchstate,diff) = create_status_code(newbranchvalues,oldbranches[newbranchpath],diffields,4)
+            newbranchvalues['state'] &= branchstate
+            # newbranchvalues['integritydiff'] = diff
+            newentry['state'] &= branchstate
+            console.log(f"{newbranchpath} : {branchstate} - integrity diff {diff}")
+
+
+def integrity_check_file(integritydb,fullpath,srcpath,diffields,update=True,digests=None): # if branch, then check only provided branch
+    relpath = mergerfs_relpath(fullpath)
+
+    oldentry = integritydb[relpath]
+    newentry = create_dbentry(fullpath,digests)
+
+    dbentry_check_consistency_obsolete(newentry,diffields)
+    dbentry_check_consistency(newentry,srcpath,diffields)
+    dbentry_check_integrity_obsolete(newentry,oldentry,diffields)
+    dbentry_check_integrity(newentry,oldentry,diffields)
+
+    # console.log("INTEGRITY DB - CHECK FILE : {}".format(fullpath))
+    # console.log(f"Consistency {newentry['consistency']}")
+    # console.log(f"Integrity {newentry['integrity']}")
+    # console.log(f"State {newentry['state']}")
+    console.log(f"State {dbentry_log(newentry,diffields)}")
+
+    # console.print(oldentry)
+    # console.print(newentry)
+
+    allsame = True if newentry["integrity"] == 'OO' else False
+    allok = True
+    # for newbranch, newbranchdata in newbranches.items():
+    #     if oldbranches[newbranch]:
+    #         if oldbranches[newbranch]["digest"] != newbranchdata["digest"]:
+    #             allok &= False
+    #             oldbranches[newbranch]["state"] = 'F'
+    #         elif not allsame:
+    #             oldbranches[newbranch]["state"] = 'M'
+    #         else:
+    #             oldbranches[newbranch]["state"] = 'C'
+
+    # oldentry["time"] = time.time()
+    # if not allok:
+    #     oldentry["state"] = 'F'
+    # elif not allsame:
+    #     oldentry["state"] = 'M'
+    # elif update:
+    #     integritydb[relpath] = newentry
+    # else:
+    #     oldentry["state"] = 'C'
+
+    # if not (allsame and allok):
+    #     print(integritydb[relpath])
+
+    return allok
+
+
+def integrity_add_file(integritydb,fullpath,diffields,digests=None):
+    relpath = mergerfs_relpath(fullpath)
+    isnew = not (relpath in integritydb)
+    integritydb[relpath] = create_dbentry(fullpath,digests)
+    # if isnew:
+    #     print("    integrity_add_file - ADD : {}".format(integritydb[relpath]["state"]))
+    # else:
+    #     print("    integrity_add_file - UPDATE : {}".format(integritydb[relpath]["state"]))
+    return True
+
+
+def integrity_read_db(dbpath):
+    db = {}
+    try:
+        with gzip.open(dbpath,'rb') as f:
+            fcntl.flock(f,fcntl.LOCK_EX)
+            db = pickle.loads(f.read())
+            fcntl.flock(f,fcntl.LOCK_UN)
+    except IOError as e:
+        if e.errno != errno.ENOENT:
+            raise
+        else:
+            print("Integrity database not found, creating new ...")
+            return {}
+    return db
+
+def integrity_write_db(dbpath,db):
+    try:
+        signal.signal(signal.SIGINT,signal.SIG_IGN)
+        with gzip.open(dbpath,'wb') as fw:
+            fcntl.flock(fw,fcntl.LOCK_EX)
+            fw.write(pickle.dumps(db))
+            fcntl.flock(fw,fcntl.LOCK_UN)
+    except Exception as e:
+        msg = 'Error writing scorch DB: {} - {}'.format(dbpath,e)
+        print(msg,file=sys.stderr)
+    finally:
+        signal.signal(signal.SIGINT,signal.SIG_DFL)
+
+
+def get_relevant_skills(item):
+    """Get the sum of Python and JavaScript skill"""
+    skills = item[1]["skills"]
+
+    # Return default value that is equivalent to no skill
+    return skills.get("python", 0) + skills.get("js", 0)
+
+
+def main():
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer,
+                                  encoding='utf8',
+                                  errors='backslashreplace',
+                                  line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer,
+                                  encoding='utf8',
+                                  errors='backslashreplace',
+                                  line_buffering=True)
+
+    parser = buildargparser()
+    args = parser.parse_args()
+
+    if args.help or not args.dir:
+        print_help()
+        sys.exit(0)
+
+    args.dir = os.path.realpath(args.dir)
+
+    if not ismergerfs(args.dir):
+        print("%s is not a mergerfs mount" % args.dir)
+        sys.exit(1)
+
+    prune = args.prune
+    execute = args.execute
+    diff = args.diff.split(',')
+    includes = ['*'] if not args.include else args.include
+    excludes = args.exclude
+    excludes_cache = args.excludecache
+    caches = args.cache
+    dupfun = getdupfun(args.dup)
+    ctrlfile = mergerfs_control_file(args.dir)
+    branches = mergerfs_branches(ctrlfile)
+    (branches, caches) = build_branches_freespace(branches, caches)
+    count_branch = min(args.count,len(branches))
+    count_cache = min(1,len(caches))
+    cachetime = time.time() - (2 * 24 * 60 * 60)
+
+    try:
+        '''''
+        integritydb = integrity_read_db("/tmp/mergerfs.integrity.gz")
+        '''''
+        # integritydb = {}
+        # print(branches)
+        # print(caches)
+
+        for (dirpath,dirnames,filenames) in os.walk(args.dir):
+            if match(dirpath,excludes):
+                continue
+            if not match(dirpath,includes):
+                continue
+
+            # cache - 0 count cache if excluded from cache
+            count_cache = 0 if match(dirpath,excludes_cache) else min(1,len(caches)) 
+
+            for filename in filenames:
+                if match(filename,excludes):
+                    continue
+                if not match(filename,includes):
+                    continue
+
+                fullpath = os.path.join(dirpath,filename)
+                basepath = mergerfs_basepath(fullpath)
+                relpath  = mergerfs_relpath(fullpath)
+                existing = mergerfs_all_basepaths(fullpath,relpath)
+                (existing_caches, existing_branches) = build_existing(existing,branches,caches)
+
+                srcpath = dupfun(basepath,relpath,existing)
+                srcfile  = os.path.join(srcpath,relpath)
+                srcfile_size = os.lstat(srcfile).st_size
+                srcfile_atime = os.lstat(srcfile).st_atime
+
+                commands = {}
+
+                # CACHES
+                if count_cache > 0 and match(filename,excludes_cache): # 0 count cache if excluded from cache
+                    count_cache = 0
+                copies_cache = files_update(srcpath,relpath,existing_caches,count_cache,prune,diff,commands,"cache")
+                if (srcfile_atime > cachetime):
+                    files_backup(srcpath,relpath,srcfile_size,caches,copies_cache,count_cache,commands,logtext="to cache")
+                files_prune(relpath,srcfile_size,caches,existing_caches,copies_cache,prune,commands,logtext="cached")
+
+                # BRANCHES
+                copies = files_update(srcpath,relpath,existing_branches,count_branch,prune,diff,commands)
+                files_backup(srcpath,relpath,srcfile_size,branches,copies,count_branch,commands)
+                files_prune(relpath,srcfile_size,branches,existing_branches,copies,prune,commands)
+
+                if commands:
+                    existing_str = f'{len(existing_caches)}{len(existing_branches)}'.replace("0"," ")
+                    copies_str = f'{len(copies_cache)}{len(copies)}'.replace("0"," ")
+                    console.print(f"[green]{srcfile} [white][{existing_str}]>[{copies_str}]")
+                    # console.print(f"{commands}")
+                    # console.print(f"{existing_caches} -> {copies_cache}")
+                    # console.print(f"{existing_branches} -> {copies}")
+                    for branchname,branchdata in sorted(commands.items(), key=lambda data: data[1]["priority"]):
+                        console.print(f'{branchname} : {branchdata["command"]}')
+                        if execute:
+                            execute_cmd(branchdata["args"])
+
+                    """"
+                    if relpath in integritydb:
+                        integrity_check_file(integritydb,fullpath,srcpath,diff)
+                    else:
+                        integrity_add_file(integritydb,fullpath,diff)
+                else:
+                    if relpath in integritydb:
+                        integrity_check_file(integritydb,fullpath,srcpath,diff)
+                    else:
+                        integrity_add_file(integritydb,fullpath,diff)
+                    """
+
+                    """
+                    # nejak pridat cekovanie pred komandom
+                    allok = True
+                    srcdigest = get_file_digest(srcfile)
+                    if (relpath in integritydb) and (srcpath in integritydb[relpath]['branches']):
+                        allok = integrity_check_file_branch(integritydb,fullpath,diff,branch=srcpath,digests=srcdigest)
+                        print(allok)
+                    if allok:
+                        for branchdata in commands.values(): # commands[branch] = branchdata
+                            execute_cmd(branchdata["args"])
+                            pass
+                        # znovu pridame aj ked existuje, kedze sa pomenili data, metadata
+                        integrity_add_file(integritydb,fullpath,diff,digests={srcpath:srcdigest})
+                    """
+                # ADD IF NOT IN DATAINTEGIRTY DATABASE FOR ALL CREATED BRANCHES
+
+
+                # print("---")
+                # print("basepath: ",srcpath)
+                # print("srcpath: ",srcpath)
+                # print("srcfile: ",srcfile)
+                # print_diskdebug(srcpath, caches, existing_caches, copies_cache, branches, existing_branches, copies)
+                # print('existing_caches: {}'.format(existing_caches))
+                # print('existing_branches: {}'.format(existing_branches))
+                # print("copies_cache = {}".format(copies_cache))
+                # print("copies = {}".format(copies))
+        # pprint(integritydb)
+        # print(json.dumps(integritydb, indent=4, sort_keys=True))
+        # integrity_write_db("/tmp/mergerfs.integrity.gz",integritydb)
+
+# U - unknown? new?
+# O - file changed (updated)
+# C - file changed (not updated)
+# F - file not changed, digest failed
+# O - file not changed, digest ok, but some other file stats changed (updated)
+# O - file not changed, digest ok, no changes at all or some other file stats changed (not updated)
+
+# todo
+# zmazavanie v cache aj backing dat uplne nakoniec
+
+    except KeyboardInterrupt:
+        print("exiting: CTRL-C pressed")
+    except BrokenPipeError:
+        pass
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+   main()
